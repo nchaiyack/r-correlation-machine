@@ -20,6 +20,278 @@ library(tidyverse)
 
 # R programming...
 
+## Main driving function: `r_correlations`
+
+Validation wrapper, that calls `.compute_correlations` below;
+
+```{r}
+#| include: false
+run_correlations <- function(
+  data,
+  outcome_var,
+  ...,
+  # Optional stratification
+  stratification_vars = NULL,
+  stratification_mode = c("separate", "crossed"),
+  # Test parameters
+  default_directionality = c("two.sided", "less", "greater"),
+  directionality_map = NULL, # (default, bidirectional)
+  default_method = c("pearson", "kendall", "spearman"),
+  method_map = NULL,
+  use = "pairwise.complete.obs",
+  # Optional Bonferroni correction
+  bonferroni_correct = TRUE,
+  bonferroni_scope = c("both", "stratified_only"),
+  # Advanced options: how to deal with small/empty strata (or combinations of?)
+  drop_na_strata = TRUE,        # whether NA in any stratum counts as “not a stratum”
+  drop_empty_strata = TRUE,
+  # Diagnostic variables
+  debug.print = TRUE
+) {
+  # 1) Capture outcome
+  outcome_q    <- rlang::enquo(outcome_var)
+  outcome_name <- rlang::as_name(outcome_q)
+
+  # 2) Capture stratification (tidyselect or NULL)
+  strat_q <- rlang::enquo(stratification_vars)
+
+  strat_names <- character(0)
+  if (!rlang::quo_is_null(strat_q)) {
+    strat_sel   <- tidyselect::eval_select(strat_q, data)
+    strat_names <- names(strat_sel)
+  }
+  
+  stratification_mode <- match.arg(stratification_mode)
+  strata_sets <- .make_strata_sets(
+    strat_names,
+    if (length(stratification_mode) == 0) "unstratified" else stratification_mode[[1]]
+  )
+
+  # 3) Capture predictors from ...
+  preds_q <- rlang::enquos(..., .ignore_empty = "all")
+
+  if (length(preds_q) == 0) {
+    preds_expr <- rlang::expr(
+      !all_of(c(!!outcome_name, strat_names))
+    )
+  } else {
+    preds_expr <- rlang::expr(c(!!!preds_q))
+  }
+
+  pred_sel   <- tidyselect::eval_select(preds_expr, data)
+  pred_names <- names(pred_sel)
+  
+  
+  # 3.5) Optional Bonferroni correction
+  bonferroni_scope <- match.arg(bonferroni_scope)
+  include_unstratified <- switch(
+    bonferroni_scope,
+    both = TRUE,
+    stratified_only = FALSE
+  )
+  
+  bonf_info <- .compute_bonferroni_m(
+    data = data,
+    pred_names = pred_names,
+    strata_sets = strata_sets,
+    drop_na_strata = drop_na_strata,
+    include_unstratified = include_unstratified
+  )
+
+
+  # 4) Normalize + validate directionality (here: only allow predictors)
+  default_directionality <- match.arg(default_directionality)
+  dir_map <- .normalize_directionality(directionality, predictor_vars = pred_names, default = default_directionality)
+  
+  # 4.5) Methods for each predictor;
+  default_method <- match.arg(default_method)
+  method_by_pred <- .normalize_method_map(method_map, predictor_vars = pred_names,     default_method = default_method)
+
+  
+  # 5) Debug output (printf-style)
+  .debug_vars(debug.print, "Outcome", outcome_name)
+  .debug_vars(debug.print, "Predictor vars", pred_names)
+  .debug_map(debug.print, "Method map", method_by_pred)
+  .debug_map(debug.print, "Directionality", dir_map)
+  .debug_vars(debug.print, "Stratification vars", strat_names)
+  .debug_stratification(
+    debug = debug.print,
+    mode = stratification_mode,
+    strata_sets = strata_sets
+   )
+    if(bonferroni_correct) {
+      cli::cli_alert_info("Bonferroni scope: {bonferroni_scope}")
+      .debug_bonf(debug.print, bonf_info)
+    } else {
+      cli::cli_alert_warning("Not applying Bonferroni correction. Are you sure? I will conduct {bonf_info$m_total} tests.")
+      .debug_bonf(debug.print, bonf_info)
+    }
+
+  # 5) Defensive checks
+  if (outcome_name %in% strat_names) {
+    rlang::abort("outcome_var must not be included in stratification_vars.")
+  }
+  if (outcome_name %in% pred_names) {
+    rlang::abort("Predictor selection must not include outcome_var.")
+  }
+  if (length(intersect(pred_names, strat_names)) > 0) {
+    rlang::abort("Predictor selection must not include stratification_vars.")
+  }
+  
+  # Compute correlations *without* Bonferroni correction;
+  results <- purrr::map_dfr(
+      strata_sets,
+      \(one_strata) {
+        .compute_correlations(
+          data = data,
+          outcome = outcome_name,              # string
+          predictors = pred_names,             # character vector
+          strata = one_strata,                 # character vector (0, 1, or >1 names)
+          directionality = dir_map,            # named chr over predictors
+          method_by_predictor = method_by_pred,# named chr over predictors
+          use = use,                           # e.g. "pairwise.complete.obs"
+          min_n = 3,                            # NEW: minimum finite pairs required
+          drop_empty_strata = drop_empty_strata# NEW: drop n_pair < min_n
+        ) %>%
+          dplyr::mutate(
+            stratification_family =
+              if (length(one_strata) == 0) "unstratified"
+              else if (length(one_strata) == 1) one_strata[[1]]
+              else paste(one_strata, collapse = "×")
+          )
+      }
+    ) %>% dplyr::relocate(stratification_family, all_of(strat_names))
+  
+    # Bonferroni correct if needed;
+     if (isTRUE(bonferroni_correct)) {
+      results <- .apply_bonferroni_executed(
+        results,
+        bonferroni_scope = bonferroni_scope,
+        debug = debug.print
+      )
+     }
+  results
+}
+```
+
+
+We separate the actual statistical computations, which take considerably more
+"dumber" arguments (strings, lists of strings) vs. a fancy tidy-like interface.
+
+
+
+```{r}
+#| include: false
+.debug_vars <- function(debug, label, vars) {
+  if (!isTRUE(debug)) return(invisible(NULL))
+
+  if (length(vars) == 0) {
+    cli::cli_alert_info("{label}: <none>")
+  } else {
+    cli::cli_alert_info(
+      "{label} ({length(vars)}): {paste(vars, collapse = ', ')}"
+    )
+  }
+
+  invisible(NULL)
+}
+```
+
+The heart of `run_correlations`, where the statistical computations actually happen
+(except for Bonferroni adjustment of p-values). All quoted variables have been
+expanded to strings, tidyselect expressions expanded  to lists of variables, default
+values applied to `directionality`, `method_by_predictor`, etc.
+
+`
+```{r}
+.cor_wrapper <- function(enable, ...) {
+  if(enable) stats::cor(...) else NA_real_
+}
+
+.cor_test_wrapper <- function(enable, ...) {
+  if(enable) stats::cor.test(...) else list(p.value = NA_real_)
+}
+
+.compute_correlations <- function(
+  data,
+  outcome,
+  predictors,
+  strata = character(0),
+  directionality,
+  method_by_predictor,
+  use = "pairwise.complete.obs",
+  min_n = 3,
+  drop_empty_strata = TRUE
+) {
+  keep <- unique(c(outcome, predictors, strata))
+  d <- dplyr::select(data, dplyr::all_of(keep))
+
+  if (length(strata) > 0) {
+    d <- dplyr::group_by(d, dplyr::across(dplyr::all_of(strata)))
+  }
+
+  res <- d %>%
+    tidyr::pivot_longer(dplyr::all_of(predictors),
+                        names_to = "predictor", values_to = "x") %>%
+    dplyr::group_by(dplyr::across(dplyr::all_of(strata)), .data$predictor) %>%
+    dplyr::summarise(
+      outcome = outcome,
+      method = unname(method_by_predictor[.data$predictor][1]),
+      n_pair = {
+        x <- .data$x
+        y <- .data[[outcome]]
+        sum(is.finite(x) & is.finite(y))
+      },
+      cor =
+         .cor_wrapper(.data$n_pair >= min_n, .data$x, .data[[outcome]], method = .data$method[1], use = use)
+      ,
+      p_value =
+         .cor_test_wrapper(.data$n_pair >= min_n, .data$x, .data[[outcome]], method = .data$method[1])$p.value,
+      ,
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(directionality = unname(directionality[.data$predictor]))
+
+  if (isTRUE(drop_empty_strata)) {
+    res <- dplyr::filter(res, .data$n_pair >= min_n)
+  }
+
+  res
+}
+```
+
+If enabled, apply Bonferroni correction to`.compute_correlations(...)` p-values:
+
+```{r}
+.apply_bonferroni_executed <- function(res, bonferroni_scope = c("both", "stratified_only"), debug = TRUE) {
+  bonferroni_scope <- match.arg(bonferroni_scope)
+
+  in_scope <- switch(
+    bonferroni_scope,
+    both = rep(TRUE, nrow(res)),
+    stratified_only = res$stratification_family != "unstratified"
+  )
+
+  # Executed tests = rows that are in-scope AND have a p-value (after dropping empties)
+  m_executed <- sum(in_scope & !is.na(res$p_value))
+
+  if (isTRUE(debug)) {
+    cli::cli_alert_info("Bonferroni correction for executed tests (m): {m_executed}")
+  }
+
+  if (m_executed == 0) {
+    res$p_bonf <- NA_real_
+    return(res)
+  }
+
+  res$p_bonf <- NA_real_
+  res$p_bonf[in_scope & !is.na(res$p_value)] <- pmin(1, res$p_value[in_scope & !is.na(res$p_value)] * m_executed)
+  res
+}
+```
+
+
+
 ## Stratification helpers
 
 ```{r}
@@ -66,11 +338,11 @@ library(tidyverse)
 ## Optional test directionality parameter helpers
 
 ```{r}
-.normalize_directionality <- function(directionality, predictor_vars) {
+.normalize_directionality <- function(directionality, predictor_vars, default = "two.sided") {
   stopifnot(is.character(predictor_vars), length(predictor_vars) >= 0)
 
   # Start with defaults for every predictor
-  dir <- stats::setNames(rep("two.sided", length(predictor_vars)), predictor_vars)
+  dir <- stats::setNames(rep(default, length(predictor_vars)), predictor_vars)
 
   if (is.null(directionality)) {
     return(dir)
@@ -249,272 +521,6 @@ library(tidyverse)
 }
 ```
 
-## Main driving function
-
-Main driving function (help from ChatGPT in R techniques - https://chatgpt.com/share/6942f1b9-9744-800f-8f6f-9021bca82c04).
-
-We separate the actual statistical computations, which take considerably more
-"dumber" arguments (strings, lists of strings) vs. a fancy tidy-like interface.
-
-```{r}
-#| include: false
-.debug_vars <- function(debug, label, vars) {
-  if (!isTRUE(debug)) return(invisible(NULL))
-
-  if (length(vars) == 0) {
-    cli::cli_alert_info("{label}: <none>")
-  } else {
-    cli::cli_alert_info(
-      "{label} ({length(vars)}): {paste(vars, collapse = ', ')}"
-    )
-  }
-
-  invisible(NULL)
-}
-```
-
-The heart of `run_correlations`, where the statistical computations actually happen
-(except for Bonferroni adjustment of p-values). All quoted variables have been
-expanded to strings, tidyselect expressions expanded  to lists of variables, default
-values applied to `directionality`, `method_by_predictor`, etc.
-
-`
-```{r}
-.compute_correlations <- function(
-  data,
-  outcome,
-  predictors,
-  strata = character(0),
-  directionality,
-  method_by_predictor,
-  use = "pairwise.complete.obs",
-  min_n = 3,
-  drop_empty_strata = TRUE
-) {
-  keep <- unique(c(outcome, predictors, strata))
-  d <- dplyr::select(data, dplyr::all_of(keep))
-
-  if (length(strata) > 0) {
-    d <- dplyr::group_by(d, dplyr::across(dplyr::all_of(strata)))
-  }
-
-  res <- d %>%
-    tidyr::pivot_longer(dplyr::all_of(predictors),
-                        names_to = "predictor", values_to = "x") %>%
-    dplyr::group_by(dplyr::across(dplyr::all_of(strata)), .data$predictor) %>%
-    dplyr::summarise(
-      outcome = outcome,
-      method = unname(method_by_predictor[.data$predictor][1]),
-      n_pair = {
-        x <- .data$x
-        y <- .data[[outcome]]
-        sum(is.finite(x) & is.finite(y))
-      }
-    ) %>%
-    dplyr::filter(
-      .data$n_pair >= min_n
-    ) %>%
-    dplyr::mutate(
-      cor = dplyr::if_else(
-        .data$n_pair >= min_n,
-        suppressWarnings(stats::cor(.data$x, .data[[outcome]], method = .data$method[1], use = use)),
-        NA_real_
-      ),
-      p_value = dplyr::if_else(
-        .data$n_pair >= min_n,
-        suppressWarnings(stats::cor.test(.data$x, .data[[outcome]], method = .data$method[1])$p.value),
-        NA_real_
-      ),
-      .groups = "drop"
-    ) %>%
-    dplyr::mutate(directionality = unname(directionality[.data$predictor]))
-
-  if (isTRUE(drop_empty_strata)) {
-    res <- dplyr::filter(res, .data$n_pair >= min_n)
-  }
-
-  res
-}
-```
-
-If enabled, apply Bonferroni correction to`.compute_correlations(...)` p-values:
-
-```{r}
-.apply_bonferroni_executed <- function(res, bonferroni_scope = c("both", "stratified_only"), debug = TRUE) {
-  bonferroni_scope <- match.arg(bonferroni_scope)
-
-  in_scope <- switch(
-    bonferroni_scope,
-    both = rep(TRUE, nrow(res)),
-    stratified_only = res$stratification_family != "unstratified"
-  )
-
-  # Executed tests = rows that are in-scope AND have a p-value (after dropping empties)
-  m_executed <- sum(in_scope & !is.na(res$p_value))
-
-  if (isTRUE(debug)) {
-    cli::cli_alert_info("Bonferroni correction for executed tests (m): {m_executed}")
-  }
-
-  if (m_executed == 0) {
-    res$p_bonf <- NA_real_
-    return(res)
-  }
-
-  res$p_bonf <- NA_real_
-  res$p_bonf[in_scope & !is.na(res$p_value)] <- pmin(1, res$p_value[in_scope & !is.na(res$p_value)] * m_executed)
-  res
-}
-```
-
-
-```{r}
-#| include: false
-run_correlations <- function(
-  data,
-  outcome_var,
-  ...,
-  # Optional stratification
-  stratification_vars = NULL,
-  stratification_mode = c("separate", "crossed"),
-  # Test parameters
-  directionality = NULL, # (default, bidirectional)
-  default_method = c("pearson", "kendall", "spearman"),
-  method_map = NULL,
-  use = "pairwise.complete.obs",
-  # Optional Bonferroni correction
-  bonferroni_correct = TRUE,
-  bonferroni_scope = c("both", "stratified_only"),
-  # Advanced options: how to deal with small/empty strata (or combinations of?)
-  drop_na_strata = TRUE,        # whether NA in any stratum counts as “not a stratum”
-  drop_empty_strata = TRUE,
-  # Diagnostic variables
-  debug.print = TRUE
-) {
-  # 1) Capture outcome
-  outcome_q    <- rlang::enquo(outcome_var)
-  outcome_name <- rlang::as_name(outcome_q)
-
-  # 2) Capture stratification (tidyselect or NULL)
-  strat_q <- rlang::enquo(stratification_vars)
-
-  strat_names <- character(0)
-  if (!rlang::quo_is_null(strat_q)) {
-    strat_sel   <- tidyselect::eval_select(strat_q, data)
-    strat_names <- names(strat_sel)
-  }
-  
-  stratification_mode <- match.arg(stratification_mode)
-  strata_sets <- .make_strata_sets(
-    strat_names,
-    if (length(stratification_mode) == 0) "unstratified" else stratification_mode[[1]]
-  )
-
-  # 3) Capture predictors from ...
-  preds_q <- rlang::enquos(..., .ignore_empty = "all")
-
-  if (length(preds_q) == 0) {
-    preds_expr <- rlang::expr(
-      !all_of(c(!!outcome_name, strat_names))
-    )
-  } else {
-    preds_expr <- rlang::expr(c(!!!preds_q))
-  }
-
-  pred_sel   <- tidyselect::eval_select(preds_expr, data)
-  pred_names <- names(pred_sel)
-  
-  
-  # 3.5) Optional Bonferroni correction
-  bonferroni_scope <- match.arg(bonferroni_scope)
-  include_unstratified <- switch(
-    bonferroni_scope,
-    both = TRUE,
-    stratified_only = FALSE
-  )
-  
-  bonf_info <- .compute_bonferroni_m(
-    data = data,
-    pred_names = pred_names,
-    strata_sets = strata_sets,
-    drop_na_strata = drop_na_strata,
-    include_unstratified = include_unstratified
-  )
-
-
-  # 4) Normalize + validate directionality (here: only allow predictors)
-  dir_map <- .normalize_directionality(directionality, predictor_vars = pred_names)
-  
-  # 4.5) Methods for each predictor;
-  default_method <- match.arg(default_method)
-  method_by_pred <- .normalize_method_map(method_map, predictor_vars = pred_names,     default_method = default_method)
-
-  
-  # 5) Debug output (printf-style)
-  .debug_vars(debug.print, "Outcome", outcome_name)
-  .debug_vars(debug.print, "Predictor vars", pred_names)
-  .debug_map(debug.print, "Method map", method_by_pred)
-  .debug_map(debug.print, "Directionality", dir_map)
-  .debug_vars(debug.print, "Stratification vars", strat_names)
-  .debug_stratification(
-    debug = debug.print,
-    mode = stratification_mode,
-    strata_sets = strata_sets
-   )
-    if(bonferroni_correct) {
-      cli::cli_alert_info("Bonferroni scope: {bonferroni_scope}")
-      .debug_bonf(debug.print, bonf_info)
-    } else {
-      cli::cli_alert_warning("Not applying Bonferroni correction. Are you sure? I will conduct {bonf_info$m_total} tests.")
-      .debug_bonf(debug.print, bonf_info)
-    }
-
-  # 5) Defensive checks
-  if (outcome_name %in% strat_names) {
-    rlang::abort("outcome_var must not be included in stratification_vars.")
-  }
-  if (outcome_name %in% pred_names) {
-    rlang::abort("Predictor selection must not include outcome_var.")
-  }
-  if (length(intersect(pred_names, strat_names)) > 0) {
-    rlang::abort("Predictor selection must not include stratification_vars.")
-  }
-  
-  # Compute correlations *without* Bonferroni correction;
-  results <- purrr::map_dfr(
-      strata_sets,
-      \(one_strata) {
-        .compute_correlations(
-          data = data,
-          outcome = outcome_name,              # string
-          predictors = pred_names,             # character vector
-          strata = one_strata,                 # character vector (0, 1, or >1 names)
-          directionality = dir_map,            # named chr over predictors
-          method_by_predictor = method_by_pred,# named chr over predictors
-          use = use,                           # e.g. "pairwise.complete.obs"
-          min_n = 3,                            # NEW: minimum finite pairs required
-          drop_empty_strata = drop_empty_strata# NEW: drop n_pair < min_n
-        ) %>%
-          dplyr::mutate(
-            stratification_family =
-              if (length(one_strata) == 0) "unstratified"
-              else if (length(one_strata) == 1) one_strata[[1]]
-              else paste(one_strata, collapse = "×")
-          )
-      }
-    ) %>% dplyr::relocate(stratification_family, all_of(strat_names))
-  
-    # Bonferroni correct if needed;
-     if (isTRUE(bonferroni_correct)) {
-      results <- .apply_bonferroni_executed(
-        results,
-        bonferroni_scope = bonferroni_scope,
-        debug = debug.print
-      )
-     }
-  results
-}
-```
 
 # Examples
 
@@ -531,6 +537,12 @@ mtcars %>% run_correlations(
   mpg,
   stratification_vars = c(cyl, gear),
   disp, hp, drat, wt, qsec
+)
+# You can optionally choose between bi- and unidirectional variables:
+mtcars %>% run_correlations(
+  mpg,
+  disp, hp, drat,
+  directionality = list(disp = "less")
 )
 # On ordinal variables, we can also optionally conduct Spearman's rho and Kendall's tau;
 mtcars %>% run_correlations(
