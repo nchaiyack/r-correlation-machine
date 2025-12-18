@@ -44,9 +44,8 @@ run_correlations <- function(
   bonferroni_scope = c("both", "stratified_only"),
   # Advanced options: how to deal with small/empty strata (or combinations of?)
   drop_na_strata = TRUE,        # whether NA in any stratum counts as “not a stratum”
-  drop_empty_strata = TRUE,
   # Diagnostic variables
-  debug.print = TRUE
+  debug_print = TRUE
 ) {
   # 1) Capture outcome
   outcome_q    <- rlang::enquo(outcome_var)
@@ -101,7 +100,7 @@ run_correlations <- function(
 
   # 4) Normalize + validate directionality (here: only allow predictors)
   default_directionality <- match.arg(default_directionality)
-  dir_map <- .normalize_directionality(directionality, predictor_vars = pred_names, default = default_directionality)
+  dir_map <- .normalize_directionality(directionality_map, predictor_vars = pred_names, default = default_directionality)
   
   # 4.5) Methods for each predictor;
   default_method <- match.arg(default_method)
@@ -109,22 +108,22 @@ run_correlations <- function(
 
   
   # 5) Debug output (printf-style)
-  .debug_vars(debug.print, "Outcome", outcome_name)
-  .debug_vars(debug.print, "Predictor vars", pred_names)
-  .debug_map(debug.print, "Method map", method_by_pred)
-  .debug_map(debug.print, "Directionality", dir_map)
-  .debug_vars(debug.print, "Stratification vars", strat_names)
+  .debug_vars(debug_print, "Outcome", outcome_name)
+  .debug_vars(debug_print, "Predictor vars", pred_names)
+  .debug_map(debug_print, "Method map", method_by_pred)
+  .debug_map(debug_print, "Directionality", dir_map)
+  .debug_vars(debug_print, "Stratification vars", strat_names)
   .debug_stratification(
-    debug = debug.print,
+    debug = debug_print,
     mode = stratification_mode,
     strata_sets = strata_sets
    )
     if(bonferroni_correct) {
       cli::cli_alert_info("Bonferroni scope: {bonferroni_scope}")
-      .debug_bonf(debug.print, bonf_info)
+      .debug_bonf(debug_print, bonf_info)
     } else {
       cli::cli_alert_warning("Not applying Bonferroni correction. Are you sure? I will conduct {bonf_info$m_total} tests.")
-      .debug_bonf(debug.print, bonf_info)
+      .debug_bonf(debug_print, bonf_info)
     }
 
   # 5) Defensive checks
@@ -151,7 +150,6 @@ run_correlations <- function(
           method_by_predictor = method_by_pred,# named chr over predictors
           use = use,                           # e.g. "pairwise.complete.obs"
           min_n = 3,                            # NEW: minimum finite pairs required
-          drop_empty_strata = drop_empty_strata# NEW: drop n_pair < min_n
         ) %>%
           dplyr::mutate(
             stratification_family =
@@ -167,7 +165,7 @@ run_correlations <- function(
       results <- .apply_bonferroni_executed(
         results,
         bonferroni_scope = bonferroni_scope,
-        debug = debug.print
+        debug = debug_print
       )
      }
   results
@@ -538,11 +536,19 @@ mtcars %>% run_correlations(
   stratification_vars = c(cyl, gear),
   disp, hp, drat, wt, qsec
 )
+# You can run analyses by combinations of strata, and subgroups < 3 will be
+# dropped;
+mtcars %>% run_correlations(
+  mpg,
+  stratification_vars = c(cyl, gear, carb),
+  stratification_mode = "crossed",
+  disp, hp, drat, wt, qsec
+)
 # You can optionally choose between bi- and unidirectional variables:
 mtcars %>% run_correlations(
   mpg,
   disp, hp, drat,
-  directionality = list(disp = "less")
+  directionality_map = list(disp = "less")
 )
 # On ordinal variables, we can also optionally conduct Spearman's rho and Kendall's tau;
 mtcars %>% run_correlations(
@@ -555,14 +561,6 @@ mtcars %>% run_correlations(
 Examples of more obscure features:
 
 ```{r}
-# You can run analyses by combinations of strata, and subgroups < 3 will be
-# dropped;
-mtcars %>% run_correlations(
-  mpg,
-  stratification_vars = c(cyl, gear),
-  stratification_mode = "crossed",
-  disp, hp, drat, wt, qsec
-)
 # You can choose to only Bonferroni-correct within-strata correlations;
 mtcars %>% run_correlations(
   mpg,
